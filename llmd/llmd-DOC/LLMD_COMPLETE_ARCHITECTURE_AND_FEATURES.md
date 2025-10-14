@@ -51,6 +51,87 @@ LLMD follows the **llm-d** (LLM Disaggregated) architecture pattern:
 
 ---
 
+## LLM Inference Phases (Baseline, without LLMD)
+
+### High-level Phases
+```
+USER PROMPT → [Tokenization] → [Prefill (build KV cache)] → [Decode Loop]
+                                   │                           │
+                                   ▼                           ▼
+                             KV cache in GPU             Sampling, logits,
+                             memory for each token       streaming tokens
+```
+
+### Step-by-step (Single Pod, Single Container)
+```
+┌──────────────────────────────────────────────────────────────┐
+│                 BASELINE (No Disaggregation)                  │
+└──────────────────────────────────────────────────────────────┘
+
+1) Tokenization
+   • Convert input text → token IDs
+
+2) Prefill (a.k.a. prompt processing)
+   • Run full model over all prompt tokens
+   • Build KV cache (keys/values) layer-by-layer
+   • Produce first output token logits
+
+3) Decode loop (auto-regressive generation)
+   • For each new token:
+     - Look up/use KV cache
+     - Run model for 1 token step
+     - Sample next token (top-p/top-k/temperature)
+     - Stream token to client
+```
+
+### Observations (Baseline)
+- **Prefill** is compute- and bandwidth-heavy but parallel across tokens.
+- **Decode** is sequential and memory-bound; KV cache dominates memory.
+- Single process does both phases; limited control over scaling/cost.
+
+---
+
+## How LLMD Changes the Phases (Phase-by-Phase)
+
+### High-level Changes
+```
+USER PROMPT → Gateway → Scheduler (EPP) → Decode Pod (sidecar) →
+  ├─ new conversation? YES → Prefill Pod (parallel, fast) → first token + KV →
+  └─ NO → reuse KV
+Decode Pod (local vLLM) → stream tokens → client
+```
+
+### What Changes
+- **Routing**: Requests enter via Gateway; Scheduler picks the best pod.
+- **Disaggregation**: Prefill and Decode run on different pods (optional).
+- **KV Mobility**: KV cache (or metadata) is transferred/attached across pods.
+- **Parallelism Tuning**: Prefill prefers high TP (e.g., TP=8); Decode prefers smaller TP and more replicas.
+
+### Step-by-step (Disaggregated)
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    LLMD DISAGGREGATED FLOW                   │
+└──────────────────────────────────────────────────────────────┘
+
+1) Gateway → Scheduler (EPP)
+   • Chooses decode pod based on load, KV locality, criticality
+
+2) Decode Pod (Routing Sidecar)
+   • New conversation?
+     - YES → Forward to Prefill Pod
+     - NO  → Call local vLLM decode directly with existing KV
+
+3) Prefill Pod (when needed)
+   • Process full prompt in parallel (high TP)
+   • Return first token + KV metadata
+
+4) Decode Pod (local vLLM)
+   • Attach KV
+   • Generate sequential tokens; stream to client
+```
+
+---
+
 ## Full Architecture Overview
 
 ### System Components
@@ -237,6 +318,26 @@ User Creates LLMInferenceService
 | 15 | **Routing Sidecar** | Architecture | Stable | Auto-injected in decode pods |
 | 16 | **LoRA Adapters** | ML Feature | Experimental | Low-Rank Adaptation support |
 | 17 | **Model Criticality** | Scheduling | Experimental | Priority-based scheduling |
+
+---
+
+## Feature-to-Phase Matrix (What runs where and when)
+
+```
+| Feature                        | Affects Phase | Prefill Pod Role                 | Decode Pod Role                    | Notes |
+|--------------------------------|--------------|----------------------------------|------------------------------------|-------|
+| Prefill/Decode Disaggregation  | Prefill,Decode | Prefill only                     | Decode only                        | Split phases to optimize cost/latency |
+| Scheduler (EPP)                | Routing       | n/a                              | Sidecar receives routed requests   | Chooses best pod (load, KV, criticality) |
+| Tensor Parallelism (TP)        | Prefill,Decode | High TP recommended               | Low/medium TP, more replicas       | TP shards tensors within each layer |
+| Pipeline Parallelism (PP)      | Prefill       | Multi-node stages (optional)     | Typically unused for decode        | Use with TP when model is ultra-large |
+| Data Parallelism (DP)          | Prefill,Decode | Multiple replicas for throughput  | Multiple replicas for throughput   | Training: sync gradients; Inference: LB |
+| Expert Parallelism (MoE)       | Prefill,Decode | Router activates experts          | Router activates experts           | Combine with TP in MoE models |
+| Gateway API / Ingress          | Routing       | n/a                              | n/a                                | External exposure and path routing |
+| InferencePool                  | Routing       | Discovery for prefill pods        | Discovery for decode pods          | Gateway/Scheduler uses this list |
+| Routing Sidecar                | Routing,Decode | n/a                              | Decides prefill vs local decode    | Handles KV metadata and forwarding |
+| LoRA Adapters                  | Prefill,Decode | Load adapters                     | Load adapters                      | Model+adapter composition at runtime |
+| Model Criticality              | Routing       | n/a                              | n/a                                | Scheduler prioritizes by criticality |
+```
 
 ---
 
@@ -693,7 +794,7 @@ spec:
 **Architecture:**
 ```
 ┌────────────────────────────────────────────────────────────┐
-│                   DISAGGREGATED SERVING                               │
+│                   DISAGGREGATED SERVING                    │
 └────────────────────────────────────────────────────────────┘
 
 USER REQUEST
@@ -703,35 +804,27 @@ GATEWAY (Envoy)
      │
      ▼
 SCHEDULER (EPP)
-     │ Route to decode pod
+     │ Route to best decode pod
      ▼
-┌───────────────────────────────┐
-│          DECODE POD 1         │
-│  ┌─────────────────────────┐  │
-│  │ Routing Sidecar         │  │
-│  │ Port: :8000 (external)  │  │
-│  └──────────────┬──────────┘  │
-└─────────────────┼─────────────┘
-                  │ Forward to prefill
-                  ▼
-┌───────────────────────────────┐
-│          PREFILL POD 1        │
-│  ┌─────────────────────────┐  │
-│  │ vLLM Prefill            │  │
-│  │ Port: :8000 (external)  │  │
-│  └─────────────────────────┘  │
-└───────────────┬───────────────┘
-                │ KV cache + first token
+┌───────────────────────────────────────────────┐
+│                 DECODE POD                    │
+│  ┌───────────────────────────┐  ┌──────────┐ │
+│  │ Routing Sidecar (:8000)   │  │ vLLM     │ │
+│  │ Decide prefill vs decode  │  │ Decode   │ │
+│  └──────────────┬────────────┘  │ (:8001)  │ │
+└─────────────────┼───────────────┴──────────┘ │
+                  │ Forward to prefill if new   │
+                  ▼                             │
+┌───────────────────────────────────────────────┐
+│                 PREFILL POD                   │
+│  ┌───────────────────────────┐                │
+│  │ vLLM Prefill (:8000)      │                │
+│  │ Process prompt (high TP)  │                │
+│  └───────────────────────────┘                │
+└───────────────┬───────────────────────────────┘
+                │ First token + KV metadata
                 ▼
-          DECODE POD 1
-          (Routing Sidecar)
-                │ Store KV cache
-                ▼
-         vLLM Decode (:8001)
-                │ Port: :8001 (internal)
-                │ Generate tokens
-                ▼
-           Stream to client
+DECODE POD (Sidecar attaches KV) → vLLM Decode (:8001) → Stream tokens
 ```
 
 #### Containers Created
@@ -808,9 +901,9 @@ Total: 2 + 16 + 1 = 19 pods
 6. Prefill Pod Processing:
    vLLM Prefill:
      - Tokenize prompt: "Tell me a story" → [token_ids]
-     - Process ALL tokens in PARALLEL (fast!)
-     - Generate KV cache for all prompt tokens
-     - Generate first output token: "Once"
+     - Process all prompt tokens (parallel across sequence)
+     - Build KV cache per layer
+     - Produce first output token (logits → sample)
    
    Response to Routing Sidecar:
      {
@@ -826,10 +919,9 @@ Total: 2 + 16 + 1 = 19 pods
    - Forwards "Once" to local vLLM Decode (:8001)
 
 8. vLLM Decode (:8001):
-   - Receives KV cache from sidecar
-   - Generates next tokens SEQUENTIALLY:
-     " upon" → " a" → " time" → ...
-   - Streams each token back to sidecar
+   - Attaches KV cache
+   - Generates next tokens sequentially (auto-regressive)
+   - Streams tokens back to sidecar
 
 9. Routing Sidecar → Gateway → User:
    Stream tokens as they're generated:
