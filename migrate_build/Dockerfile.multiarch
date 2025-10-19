@@ -1,0 +1,21 @@
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+
+# Multi-arch build metadata
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+ARG TARGETOS
+ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="MNIST Multi-Architecture"
+LABEL org.opencontainers.image.description="MNIST model serving with multi-arch support"
+LABEL org.opencontainers.image.platform="${TARGETPLATFORM}"
+
+# Add any additional configuration or files needed for multi-arch
+# This Dockerfile mainly serves to enable buildx to create the manifest
+
+# Ensure the image works across architectures
+RUN echo "Built for ${TARGETPLATFORM} on ${BUILDPLATFORM}"
+
+# Keep the original CMD/ENTRYPOINT from base image
+
