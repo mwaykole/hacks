@@ -352,8 +352,9 @@ To find information about:
 
 This documentation is actively being developed. Files marked as "Coming soon" are planned but not yet created.
 
-**Current Status**: 4/12 files complete
-**Last Updated**: November 2025
+**Current Status**: 8 files complete, 12+ planned  
+**Gap Analysis**: See [MISSING-FEATURES-ANALYSIS.md](./MISSING-FEATURES-ANALYSIS.md) for detailed roadmap  
+**Last Updated**: November 6, 2025
 
 ## 📞 Support
 

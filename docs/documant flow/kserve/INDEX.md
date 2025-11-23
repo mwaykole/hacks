@@ -19,8 +19,9 @@ This index provides a complete overview of all KServe documentation files with f
 | 06 | [RAW-KUBERNETES-DEPLOYMENT.md](./06-RAW-KUBERNETES-DEPLOYMENT.md) | Raw deployment mode | Deployment, Service, HPA | 12 |
 | 07 | [LLMD-INTEGRATION.md](./07-LLMD-INTEGRATION.md) | LLM disaggregated serving | LLMD, Prefill/Decode, KV Cache | 14 |
 | - | [README.md](./README.md) | Main documentation guide | Navigation, Index | 4 |
+| - | [MISSING-FEATURES-ANALYSIS.md](./MISSING-FEATURES-ANALYSIS.md) | Gap analysis and roadmap | Missing features, priorities | 0 |
 
-**Total**: 9 files, 90+ flowchart diagrams
+**Total**: 10 files, 90+ flowchart diagrams
 
 ### 🔜 Planned Documentation
 

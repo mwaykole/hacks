@@ -1,4 +1,4 @@
-# llm-d Repository Flowcharts - Complete Documentation
+                                            # llm-d Repository Flowcharts - Complete Documentation
 
 This folder contains comprehensive flowcharts and documentation for all core llm-d repositories, showing how each component works internally and how they integrate together.
 
@@ -67,6 +67,7 @@ graph TB
 
 | I want to... | Start Here |
 |--------------|------------|
+| **Understand ZMQ event streaming** | [ZMQ Event System](#-zmq-event-system) (this document) |
 | **Understand request scheduling logic** | [Inference Scheduler → Request Scheduling Flow](./llm-d-inference-scheduler-flows.md#33-request-scheduling-flow) |
 | **Learn how P/D disaggregation works** | [Routing Sidecar → Request Routing Flow](./llm-d-routing-sidecar-flows.md#33-request-routing-flow) |
 | **See how prefill processes prompts** | [Main → Prefill Worker Flow](./llm-d-main-flows.md#34-prefill-worker-flow) |
@@ -173,7 +174,7 @@ graph TB
     end
     
     subgraph "Observability"
-        KVManager[KV Cache Manager<br/>ZMQ Event Bus]
+        KVManager[KV Cache Manager<br/>ZMQ Event Bus :5555]
         Prometheus[Prometheus<br/>Metrics]
     end
     
@@ -192,18 +193,132 @@ graph TB
     Sidecar -->|Proxy| PrefillPod1
     Sidecar -->|Proxy| PrefillPod2
     
-    PrefillPod1 -.->|KV Events| KVManager
-    PrefillPod2 -.->|KV Events| KVManager
-    DecodePod1 -.->|KV Events| KVManager
-    DecodePod2 -.->|KV Events| KVManager
+    PrefillPod1 -.->|ZMQ PUB<br/>Cache Events| KVManager
+    PrefillPod2 -.->|ZMQ PUB<br/>Cache Events| KVManager
+    DecodePod1 -.->|ZMQ PUB<br/>Cache Events| KVManager
+    DecodePod2 -.->|ZMQ PUB<br/>Cache Events| KVManager
     
     EPP -.->|Scrape Metrics| PrefillPod1
     EPP -.->|Scrape Metrics| DecodePod1
-    EPP -.->|Query Cache| KVManager
+    EPP -.->|HTTP GET<br/>Cache State| KVManager
     
     PrefillPod1 -->|Metrics| Prometheus
     DecodePod1 -->|Metrics| Prometheus
     EPP -->|Metrics| Prometheus
+    KVManager -->|Metrics| Prometheus
+```
+
+---
+
+## 🔌 ZMQ Event System
+
+### What are ZMQ Events?
+
+**ZeroMQ (ZMQ)** is a high-performance asynchronous messaging library used in llm-d for real-time KV cache event streaming from vLLM workers to the KV Cache Manager.
+
+**Key Characteristics**:
+- **Protocol**: ZMQ PUB/SUB pattern (Publisher-Subscriber)
+- **Port**: 5555 (default)
+- **Throughput**: 1000+ events per second
+- **Latency**: Sub-millisecond event processing
+- **Architecture**: Brokerless (no message broker required)
+
+### Event Types
+
+vLLM workers publish these cache lifecycle events:
+
+| Event Type | Description | When Published |
+|------------|-------------|----------------|
+| `request_started` | New inference request begins | Request received by worker |
+| `prefill_complete` | Prefill phase finished, KV cache populated | After prompt processing |
+| `request_finished` | Entire request completed | After all tokens generated |
+| `cache_invalidate` | Cache blocks need eviction | When cache capacity reached |
+
+### Event Format
+
+```json
+{
+  "event_type": "prefill_complete",
+  "pod_id": "prefill-worker-1",
+  "request_id": "req-abc123",
+  "block_hashes": ["hash1", "hash2", "hash3"],
+  "prompt_hash": "prompt-hash-xyz",
+  "timestamp": "2025-11-06T10:00:00Z",
+  "metadata": {
+    "model": "llama-70b",
+    "sequence_length": 512,
+    "num_blocks": 3
+  }
+}
+```
+
+### Why ZMQ?
+
+| Benefit | Impact |
+|---------|--------|
+| **High Throughput** | Handles 1000s of cache events per second without blocking |
+| **Low Latency** | Non-blocking I/O ensures sub-millisecond event processing |
+| **Decoupled Architecture** | Workers publish events without waiting for acknowledgment |
+| **Multi-Publisher Support** | All workers can publish to the same manager simultaneously |
+| **Fault Tolerant** | Manager continues working even if some workers fail |
+
+### Event Flow Architecture
+
+```mermaid
+sequenceDiagram
+    participant PW1 as Prefill Worker 1
+    participant PW2 as Prefill Worker 2
+    participant DW1 as Decode Worker 1
+    participant ZMQ as ZMQ SUB Socket<br/>:5555
+    participant KVM as KV Cache Manager
+    participant EPP as EPP Scheduler
+    
+    Note over PW1,KVM: Event Publishing (Async, Non-blocking)
+    
+    PW1->>ZMQ: Publish: prefill_complete<br/>block_hashes: [h1, h2]
+    PW2->>ZMQ: Publish: prefill_complete<br/>block_hashes: [h3, h4]
+    DW1->>ZMQ: Publish: request_finished<br/>block_hashes: [h1, h5]
+    
+    Note over ZMQ,KVM: Event Processing
+    
+    ZMQ->>KVM: Event Stream
+    KVM->>KVM: Update Cache State<br/>pod_id → blocks
+    
+    Note over KVM,EPP: Cache State Query (HTTP)
+    
+    EPP->>KVM: GET /api/v1/cache-state?prompt_hash=xyz
+    KVM-->>EPP: Response: [pod1:80%, pod2:60%]
+    EPP->>EPP: Route to pod1<br/>(highest cache hit)
+```
+
+### Configuration
+
+**Worker Side** (vLLM):
+```bash
+vllm serve model-name \
+  --kv-cache-events-zmq=true \
+  --kv-cache-events-port=5555 \
+  --kv-cache-events-endpoint=tcp://kv-cache-manager:5555
+```
+
+**Manager Side**:
+```bash
+./llm-d-kv-cache-manager \
+  --zmq-port=5555 \
+  --zmq-io-threads=4 \
+  --cache-capacity=10000
+```
+
+**Kubernetes ConfigMap**:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kv-cache-config
+data:
+  ZMQ_PORT: "5555"
+  ZMQ_IO_THREADS: "4"
+  VLLM_KV_EVENT_ZMQ_ENDPOINT: "tcp://kv-cache-manager:5555"
 ```
 
 ---
@@ -304,6 +419,7 @@ vllm serve model-name \
 |---------|---------|-------------|
 | **P/D Disaggregation** | Separate prefill and decode workloads | 2-3x throughput |
 | **Cache-Aware Routing** | Route to pods with cached prompts | 50-80% latency reduction |
+| **ZMQ Event Streaming** | Real-time cache state tracking | Sub-millisecond cache updates |
 | **Load-Aware Scheduling** | Balance requests across pods | 30% better utilization |
 | **Session Affinity** | Keep conversations on same pod | Consistent performance |
 | **Distributed Caching** | Share KV cache across workers | 60% memory savings |
@@ -327,10 +443,11 @@ vllm serve model-name \
 ## 📈 Statistics
 
 - **Total Repositories Documented**: 4
-- **Total Flowcharts**: 28
-- **Total Configuration Examples**: 40+
+- **Total Flowcharts**: 29
+- **Total Configuration Examples**: 45+
 - **Total Code References**: 100+
-- **Lines of Documentation**: ~8,000+
+- **Lines of Documentation**: ~8,500+
+- **Event Types Documented**: 4 (ZMQ cache events)
 
 ---
 
@@ -360,9 +477,13 @@ To update:
 
 ---
 
-**Documentation Version**: 1.0  
-**Last Updated**: October 28, 2025  
+**Documentation Version**: 1.1  
+**Last Updated**: November 6, 2025  
 **Maintained By**: llm-d Documentation Team
+
+**Changelog**:
+- v1.1 (Nov 6, 2025): Added comprehensive ZMQ Event System section with event types, formats, and configuration examples
+- v1.0 (Oct 28, 2025): Initial complete documentation
 
 ---
 
